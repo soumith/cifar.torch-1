@@ -113,16 +113,23 @@ function train()
   indices[#indices] = nil
 
   local tic = torch.tic()
-  for t,v in ipairs(indices) do
-    xlua.progress(t, #indices)
 
-    local inputs = provider.trainData.data:index(1,v)
-    targets:copy(provider.trainData.labels:index(1,v))
+  local current = 1
+  local max = #indices
+
+  
+  while current <= max do
+    xlua.progress(current, max)
 
     local feval = function(x)
       if x ~= parameters then parameters:copy(x) end
       gradParameters:zero()
-      
+
+      if current > max then return end
+      local inputs = provider.trainData.data:index(1, current)
+      targets:copy(provider.trainData.labels:index(1, current))
+      current = current + 1
+
       local outputs = model:forward(inputs)
       local f = criterion:forward(outputs, targets)
       local df_do = criterion:backward(outputs, targets)
