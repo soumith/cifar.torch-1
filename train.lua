@@ -2,7 +2,8 @@ require 'xlua'
 require 'optim'
 require 'nn'
 dofile './provider.lua'
-local c = require 'trepl.colorize'
+lapp = require 'pl.lapp'
+local tablex = require 'pl.tablex'
 
 opt = lapp[[
    -s,--save                  (default "logs")      subdirectory to save logs
@@ -10,12 +11,15 @@ opt = lapp[[
    -r,--learningRate          (default 1)        learning rate
    --learningRateDecay        (default 1e-7)      learning rate decay
    --weightDecay              (default 0.0005)      weightDecay
-   -m,--momentum              (default 0.9)         momentum
+   -m,--momentum              (default 0.0)         momentum
    --epoch_step               (default 25)          epoch step
    --model                    (default vgg_bn_drop)     model name
    --max_epoch                (default 300)           maximum number of iterations
    --backend                  (default nn)            backend
    --type                     (default cuda)          cuda/float/cl
+   --nWorkers                 (default 2)            number of EASGD workers
+   --tau                      (default 5)            tau for EASGD
+   --alpha                    (default 0.001)        alpha for EASGD
 ]]
 
 print(opt)
@@ -55,7 +59,7 @@ local function cast(t)
    end
 end
 
-print(c.blue '==>' ..' configuring model')
+print( '==>' ..' configuring model')
 local model = nn.Sequential()
 model:add(nn.BatchFlip():float())
 model:add(cast(nn.Copy('torch.FloatTensor', torch.type(cast(torch.Tensor())))))
@@ -69,7 +73,7 @@ end
 
 print(model)
 
-print(c.blue '==>' ..' loading data')
+print( '==>' ..' loading data')
 provider = torch.load 'provider.t7'
 provider.trainData.data = provider.trainData.data:float()
 provider.testData.data = provider.testData.data:float()
@@ -78,18 +82,24 @@ confusion = optim.ConfusionMatrix(10)
 
 print('Will save at '..opt.save)
 paths.mkdir(opt.save)
-testLogger = optim.Logger(paths.concat(opt.save, 'test.log'))
-testLogger:setNames{'% mean class accuracy (train set)', '% mean class accuracy (test set)'}
-testLogger.showPlot = false
 
-parameters,gradParameters = model:getParameters()
+-------------------------------------------------------
+
+W, gW = model:getParameters()
+
+local worker = {}
+for i = 1, opt.nWorkers do
+    worker[i] = {}
+    worker[i].model = model:clone()
+    worker[i].W, worker[i].gW = worker[i].model:getParameters()
+end
 
 
-print(c.blue'==>' ..' setting criterion')
+print('==>' ..' setting criterion')
 criterion = cast(nn.CrossEntropyCriterion())
 
 
-print(c.blue'==>' ..' configuring optimizer')
+print('==>' ..' configuring optimizer')
 optimState = {
   learningRate = opt.learningRate,
   weightDecay = opt.weightDecay,
@@ -97,127 +107,109 @@ optimState = {
   learningRateDecay = opt.learningRateDecay,
 }
 
+for i=1, opt.nWorkers do
+    worker[i].state = tablex.deepcopy(optimState)
+end
+
+----------------------------------------------------------
 
 function train()
-  model:training()
-  epoch = epoch or 1
-
-  -- drop learning rate every "epoch_step" epochs
-  if epoch % opt.epoch_step == 0 then optimState.learningRate = optimState.learningRate/2 end
-  
-  print(c.blue '==>'.." online epoch # " .. epoch .. ' [batchSize = ' .. opt.batchSize .. ']')
-
-  local targets = cast(torch.FloatTensor(opt.batchSize))
-  local indices = torch.randperm(provider.trainData.data:size(1)):long():split(opt.batchSize)
-  -- remove last element so that all the batches have equal size
-  indices[#indices] = nil
-
-  local tic = torch.tic()
-
-  local current = 1
-  local max = #indices
-
-  
-  while current <= max do
-    xlua.progress(current, max)
-
-    local feval = function(x)
-      if x ~= parameters then parameters:copy(x) end
-      gradParameters:zero()
-
-      if current > max then return end
-      local inputs = provider.trainData.data:index(1, current)
-      targets:copy(provider.trainData.labels:index(1, current))
-      current = current + 1
-
-      local outputs = model:forward(inputs)
-      local f = criterion:forward(outputs, targets)
-      local df_do = criterion:backward(outputs, targets)
-      model:backward(inputs, df_do)
-
-      confusion:batchAdd(outputs, targets)
-
-      return f,gradParameters
+    model:training() -- sets batchnorm and dropout into training mode. Modes: :training() / :evaluate()
+    for i=1, opt.nWorkers do
+        worker[i].model:training()
     end
-    optim.sgd(feval, parameters, optimState)
-  end
+    epoch = epoch or 1
 
-  confusion:updateValids()
-  print(('Train accuracy: '..c.cyan'%.2f'..' %%\t time: %.2f s'):format(
-        confusion.totalValid * 100, torch.toc(tic)))
+    -- drop learning rate every "epoch_step" epochs
+    if epoch % opt.epoch_step == 0 then optimState.learningRate = optimState.learningRate/2 end
 
-  train_acc = confusion.totalValid * 100
+    print( '==>'.." online epoch # " .. epoch .. ' [batchSize = ' .. opt.batchSize .. ']')
 
-  confusion:zero()
-  epoch = epoch + 1
+    local indices = {}
+    for i=1, opt.nWorkers do
+        indices[i] = torch.randperm(provider.trainData.data:size(1)):long():split(opt.batchSize)
+        -- remove last element so that all the batches have equal size
+        indices[i][#indices[i]] = nil
+    end
+
+    local tic = torch.tic()
+
+    local current = 1
+    local max = #indices[1]
+
+    while current <= max do
+        xlua.progress(current, max)
+
+        for i = 1, opt.nWorkers do
+                    -- elastic cost
+            if current % opt.tau == 0 then
+                local diff = opt.alpha * (worker[i].W - W)
+                worker[i].W:add(-1, diff)
+                W:add(diff)
+            end
+
+            local feval = function(x)
+                if x ~= worker[i].W then worker[i].W:copy(x) end
+                worker[i].gW:zero()
+
+                if current > max then return end
+                local inputs = provider.trainData.data:index(1, indices[i][current])
+                local targets =  cast(provider.trainData.labels:index(1, indices[i][current]))
+                current = current + 1
+
+                local outputs = worker[i].model:forward(inputs)
+                local f = criterion:forward(outputs, targets)
+                local df_do = criterion:backward(outputs, targets)
+                worker[i].model:backward(inputs, df_do)
+
+                -- confusion:batchAdd(outputs, targets)
+
+                return f, worker[i].gW
+            end
+            optim.sgd(feval, worker[i].W, worker[i].state)
+        end
+
+    end
+
+    confusion:updateValids()
+    print(('Train accuracy: '..'%.2f'..' %%\t time: %.2f s'):format(
+            confusion.totalValid * 100, torch.toc(tic)))
+
+    train_acc = confusion.totalValid * 100
+
+    confusion:zero()
+    epoch = epoch + 1
 end
 
 
-function test()
-  -- disable flips, dropouts and batch normalization
-  model:evaluate()
-  print(c.blue '==>'.." testing")
-  local bs = 125
-  for i=1,provider.testData.data:size(1),bs do
-    local outputs = model:forward(provider.testData.data:narrow(1,i,bs))
-    confusion:batchAdd(outputs, provider.testData.labels:narrow(1,i,bs))
-  end
-
-  confusion:updateValids()
-  print('Test accuracy:', confusion.totalValid * 100)
-  
-  if testLogger then
-    paths.mkdir(opt.save)
-    testLogger:add{train_acc, confusion.totalValid * 100}
-    testLogger:style{'-','-'}
-    testLogger:plot()
-
-    if paths.filep(opt.save..'/test.log.eps') then
-      local base64im
-      do
-        os.execute(('convert -density 200 %s/test.log.eps %s/test.png'):format(opt.save,opt.save))
-        os.execute(('openssl base64 -in %s/test.png -out %s/test.base64'):format(opt.save,opt.save))
-        local f = io.open(opt.save..'/test.base64')
-        if f then base64im = f:read'*all' end
-      end
-
-      local file = io.open(opt.save..'/report.html','w')
-      file:write(([[
-      <!DOCTYPE html>
-      <html>
-      <body>
-      <title>%s - %s</title>
-      <img src="data:image/png;base64,%s">
-      <h4>optimState:</h4>
-      <table>
-      ]]):format(opt.save,epoch,base64im))
-      for k,v in pairs(optimState) do
-        if torch.type(v) == 'number' then
-          file:write('<tr><td>'..k..'</td><td>'..v..'</td></tr>\n')
-        end
-      end
-      file:write'</table><pre>\n'
-      file:write(tostring(confusion)..'\n')
-      file:write(tostring(model)..'\n')
-      file:write'</pre></body></html>'
-      file:close()
+function test(model)
+    -- disable flips, dropouts and batch normalization
+    model:evaluate()
+    print( '==>'.." testing")
+    local bs = 125
+    for i=1,provider.testData.data:size(1),bs do
+        local outputs = model:forward(provider.testData.data:narrow(1,i,bs))
+        confusion:batchAdd(outputs, provider.testData.labels:narrow(1,i,bs))
     end
-  end
 
-  -- save model every 50 epochs
-  if epoch % 50 == 0 then
-    local filename = paths.concat(opt.save, 'model.net')
-    print('==> saving model to '..filename)
-    torch.save(filename, model:get(3):clearState())
-  end
+    confusion:updateValids()
+    print('Test accuracy:', confusion.totalValid * 100)
 
-  confusion:zero()
+    -- save model every 50 epochs
+    if epoch % 50 == 0 then
+        local filename = paths.concat(opt.save, 'model.net')
+        print('==> saving model to '..filename)
+        torch.save(filename, model:get(3):clearState())
+    end
+
+    confusion:zero()
 end
 
 
 for i=1,opt.max_epoch do
-  train()
-  test()
+    train()
+    test(model)
+    for i=1, opt.nWorkers do
+        test(worker[i].model)
+    end
 end
-
-
